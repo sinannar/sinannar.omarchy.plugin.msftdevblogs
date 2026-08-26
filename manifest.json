@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "id": "sinannar.clock",
-  "name": "My Clock",
+  "id": "sinannar.omarchy.plugin.msftdevblogs",
+  "name": "MSFT Dev Blogs",
   "version": "1.0.0",
   "author": "Omarchy",
   "description": "Date/time label with a calendar popup",
@@ -12,7 +12,7 @@
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "My Clock",
+    "displayName": "MSFT Dev Blogs",
     "description": "Date/time label with a calendar popup",
     "category": "Time",
     "allowMultiple": false
