@@ -3,8 +3,8 @@
   "id": "sinannar.omarchy.plugin.msftdevblogs",
   "name": "MSFT Dev Blogs",
   "version": "1.0.0",
-  "author": "Omarchy",
-  "description": "Date/time label with a calendar popup",
+  "author": "sinannar",
+  "description": "Recent posts from the Microsoft for Developers RSS feed, with a panel to browse and open them",
   "kinds": [
     "bar-widget"
   ],
@@ -13,11 +13,8 @@
   },
   "barWidget": {
     "displayName": "MSFT Dev Blogs",
-    "description": "Date/time label with a calendar popup",
-    "category": "Time",
+    "description": "Recent posts from the Microsoft for Developers RSS feed, with a panel to browse and open them",
+    "category": "News",
     "allowMultiple": false
-  },
-  "omarchy": {
-    "clonedFrom": "omarchy.clock"
   }
 }

@@ -1,308 +1,218 @@
-// Pure date and format math for the clock widget and its calendar panel.
-// Everything here is locale- and Qt-free so it can be unit tested under node
-// (test/shell.d/clock-test.sh); the QML owns month/weekday naming through
-// Qt.locale().
-
-var MS_PER_DAY = 86400000
-
-// Weekday indices match both JS Date.getDay() and QML's Locale.Sunday…
-// Locale.Saturday, so a locale's firstDayOfWeek can be passed straight in.
-var WEEKDAY_NAMES = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
-
-// ---- Bar label formats. Right-clicking the clock walks these in order and
-//      writes the result back to shell.json, so the label the bar shows and
-//      the format the config stores are always the same thing.
+// Pure RSS-parsing and normalization math for the Microsoft Dev Blogs
+// widget and its post-list panel. Everything here is Qt-free so it can be
+// unit tested under node; the QML owns process invocation, polling, and
+// rendering only.
 //
-// The locale-shaped time presets are each followed by their 12-hour twin, so
-// the walk from a 24-hour label to the same label in AM/PM is a single right
-// click rather than a lap of the ring. The ISO preset is deliberately left
-// without one: ISO 8601 writes time on a 24-hour clock, so an AM/PM variant
-// would contradict the only thing that format is for.
-var CLOCK_FORMATS = [
-  "dddd HH:mm",
-  "dddd h:mm AP",
-  "dddd HH:mm:ss",
-  "dddd h:mm:ss AP",
-  "HH:mm",
-  "h:mm AP",
-  "ddd d MMM HH:mm",
-  "ddd d MMM h:mm AP",
-  "d MMMM 'W'ww yyyy",
-  "yyyy-MM-dd HH:mm"
-]
+// The feed (https://devblogs.microsoft.com/landing/) is a standard RSS 2.0
+// document. Rather than pull in an XML parser dependency, item fields are
+// pulled out with small, targeted regexes — the fields this plugin reads
+// (title, link, pubDate, dc:creator, category, guid) are simple leaf
+// elements that don't nest, which is what makes that safe to do here.
 
-// Vertical bars have room for a few stacked lines and nothing else, so the
-// ring stays short. AM/PM costs a fourth line, which is why only the plain
-// time carries it here.
-var VERTICAL_CLOCK_FORMATS = [
-  "HH\n—\nmm",
-  "h\n—\nmm\nAP",
-  "dd\nMMM\n'W'ww\n''yy",
-  "HH\nmm"
-]
+// ---- Producer-side caps ----------------------------------------------------
+// A malicious or unexpectedly bloated feed response can't exhaust memory in
+// the long-lived shell process.
+//
+// MAX_OUTPUT_CHARS – UTF-16 code units accepted from curl's stdout before
+//   truncation (~1 MB for the mostly-ASCII XML this feed serves).
+// MAX_ITEMS_SCANNED – <item> blocks read out of the raw XML before giving up.
+// MAX_POSTS         – posts ever kept/returned after de-duplication and
+//   sorting; the panel only ever shows the ten most recent.
+var MAX_OUTPUT_CHARS = 1 * 1024 * 1024
+var MAX_ITEMS_SCANNED = 200
+var MAX_POSTS = 10
 
-// Whether a format prints seconds, so the widget can tick once a second only
-// for the formats that show them. Quoted literals go first: the s in a 'Sat'
-// is text rather than a token, and an opening quote with no closing one runs
-// to the end of the format the way Qt reads it.
-function clockNeedsSeconds(format) {
-  var text = String(format === undefined || format === null ? "" : format)
-  return /s/.test(text.replace(/'[^']*'?/g, ""))
+function capOutput(text) {
+  var s = String(text === undefined || text === null ? "" : text)
+  if (s.length > MAX_OUTPUT_CHARS) return s.substring(0, MAX_OUTPUT_CHARS)
+  return s
 }
 
-function clockFormats(vertical) {
-  return vertical ? VERTICAL_CLOCK_FORMATS.slice() : CLOCK_FORMATS.slice()
+// Appends a stream chunk while preserving a hard MAX_OUTPUT_CHARS cap, for
+// QML stream parsers to bound memory *during collection*, not only after
+// process exit.
+function appendCapped(existing, chunk) {
+  var current = String(existing === undefined || existing === null ? "" : existing)
+  if (current.length >= MAX_OUTPUT_CHARS) return current
+  var next = String(chunk === undefined || chunk === null ? "" : chunk)
+  if (next === "") return current
+  var remaining = MAX_OUTPUT_CHARS - current.length
+  if (next.length > remaining) next = next.substring(0, remaining)
+  return current + next
 }
 
-// The presets in a fixed order, plus the configured alternate and current
-// format when they are something else. The order must not depend on which
-// entry is current: cycling writes the result back to shell.json, and a ring
-// that reshuffled itself around the current value would bounce between two
-// entries instead of walking.
-function clockFormatRing(configured, configuredAlt, presets) {
-  var ring = []
-  var candidates = (presets || []).concat([configuredAlt, configured])
-  for (var i = 0; i < candidates.length; i++) {
-    var format = String(candidates[i] === undefined || candidates[i] === null ? "" : candidates[i])
-    if (format === "" || ring.indexOf(format) !== -1) continue
-    ring.push(format)
+// True if a collected string hit the hard MAX_OUTPUT_CHARS boundary, meaning
+// the feed likely sent more than was retained. Callers use this to tell
+// "the server sent nothing/garbage" apart from "a real response was cut off
+// mid-stream", so a resulting parse failure keeps the last-known-good posts
+// instead of blanking the panel.
+function wasCapped(text) {
+  return String(text === undefined || text === null ? "" : text).length >= MAX_OUTPUT_CHARS
+}
+
+// Only http/https links are ever surfaced or opened by this plugin — other
+// schemes could trigger unintended external-handler behavior when passed to
+// Qt.openUrlExternally, so anything else is dropped.
+function isSafeHttpUrl(url) {
+  return typeof url === "string" && /^https?:\/\//i.test(String(url).trim())
+}
+
+// Decodes the handful of entities RSS text actually uses. Numeric entities
+// (decimal and hex) are decoded generically; anything malformed is left as
+// literal text rather than throwing.
+function decodeEntities(text) {
+  var s = String(text === undefined || text === null ? "" : text)
+  s = s.replace(/&#x([0-9a-fA-F]+);/g, function(_, hex) {
+    var code = parseInt(hex, 16)
+    return isFinite(code) ? String.fromCodePoint(code) : _
+  })
+  s = s.replace(/&#(\d+);/g, function(_, dec) {
+    var code = parseInt(dec, 10)
+    return isFinite(code) ? String.fromCodePoint(code) : _
+  })
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, "\"")
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&")
+}
+
+// Strips a CDATA wrapper if present, otherwise decodes XML entities. RSS
+// producers use one or the other for text content, never both at once.
+function unwrapText(raw) {
+  var s = String(raw === undefined || raw === null ? "" : raw).trim()
+  var cdata = /^<!\[CDATA\[([\s\S]*?)\]\]>$/.exec(s)
+  if (cdata) return cdata[1].trim()
+  return decodeEntities(s)
+}
+
+// Strips any HTML tags left in a title/description after CDATA unwrapping —
+// dc:creator and title are supposed to be plain text, but a feed producer
+// occasionally leaks markup into them.
+function stripTags(text) {
+  return String(text === undefined || text === null ? "" : text).replace(/<[^>]*>/g, "").trim()
+}
+
+// Splits raw feed XML into individual <item>...</item> blocks. Namespaced
+// root elements (rss/channel) are irrelevant to this: items are always a
+// flat, non-nested run of siblings under <channel>. Capped at
+// MAX_ITEMS_SCANNED so a pathological feed can't cause unbounded work.
+function extractItemBlocks(xmlText) {
+  var text = capOutput(xmlText)
+  var blocks = []
+  var re = /<item\b[^>]*>([\s\S]*?)<\/item>/gi
+  var match
+  while ((match = re.exec(text)) !== null && blocks.length < MAX_ITEMS_SCANNED) {
+    blocks.push(match[1])
   }
-  return ring.length > 0 ? ring : ["HH:mm"]
+  return blocks
 }
 
-// Next entry after `current`. An unknown current format (a hand-written one
-// that is not in the ring) starts the walk at the top.
-function nextClockFormat(ring, current) {
-  if (!ring || ring.length === 0) return ""
-  var index = ring.indexOf(String(current === undefined || current === null ? "" : current))
-  return ring[(index + 1) % ring.length]
+// Extracts the first `<tagName>...</tagName>` (or self-namespaced
+// `<ns:tagName>...</ns:tagName>`) from one item block, unwrapped/decoded.
+// Returns "" when the tag is missing rather than throwing.
+function extractTag(itemXml, tagName) {
+  var escaped = String(tagName).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  var re = new RegExp("<" + escaped + "\\b[^>]*>([\\s\\S]*?)<\\/" + escaped + ">", "i")
+  var match = re.exec(String(itemXml || ""))
+  return match ? unwrapText(match[1]) : ""
 }
 
-// Two-digit ISO week, substituted into a format's 'ww' token before Qt
-// formats it -- Qt has no ISO week specifier of its own.
-function isoWeekLiteral(year, month, day) {
-  return pad2(isoWeek(year, month, day))
-}
-
-function pad2(value) {
-  var n = Number(value)
-  return (n < 10 ? "0" : "") + n
-}
-
-// Stable "yyyy-MM-dd" identity for a day, so a grid cell can be compared
-// against today without dragging Date objects through bindings.
-function dateKey(year, month, day) {
-  return year + "-" + pad2(Number(month) + 1) + "-" + pad2(day)
-}
-
-function keyForDate(date) {
-  return dateKey(date.getFullYear(), date.getMonth(), date.getDate())
-}
-
-function coerceWeekStart(value) {
-  if (value === undefined || value === null) return null
-  if (typeof value === "number")
-    return isFinite(value) ? ((Math.round(value) % 7) + 7) % 7 : null
-
-  var text = String(value).replace(/^\s+|\s+$/g, "").toLowerCase()
-  if (text === "") return null
-
-  for (var i = 0; i < WEEKDAY_NAMES.length; i++)
-    if (WEEKDAY_NAMES[i] === text || WEEKDAY_NAMES[i].substr(0, 3) === text) return i
-
-  var parsed = parseInt(text, 10)
-  return isFinite(parsed) ? ((parsed % 7) + 7) % 7 : null
-}
-
-// Configured week start, falling back to the locale's own first day when
-// the setting is missing or nonsense.
-function normalizedWeekStart(value, fallback) {
-  var configured = coerceWeekStart(value)
-  if (configured !== null) return configured
-  var fallbackStart = coerceWeekStart(fallback)
-  return fallbackStart === null ? 1 : fallbackStart
-}
-
-function weekStartSettingName(index) {
-  return WEEKDAY_NAMES[normalizedWeekStart(index, 1)]
-}
-
-// The toggle flips between the two conventions people actually switch
-// between. A calendar configured to any other start (Saturday, say) is
-// shown as-is and lands on Monday the first time it is toggled.
-function toggledWeekStart(index) {
-  return normalizedWeekStart(index, 1) === 1 ? 0 : 1
-}
-
-function weekdayOrder(weekStart) {
-  var start = normalizedWeekStart(weekStart, 1)
+// Extracts every `<category>` entry in one item block, decoded and
+// tag-stripped. A feed with none yields an empty array.
+function extractCategories(itemXml) {
+  var text = String(itemXml || "")
+  var re = /<category\b[^>]*>([\s\S]*?)<\/category>/gi
+  var match
   var out = []
-  for (var i = 0; i < 7; i++) out.push((start + i) % 7)
+  while ((match = re.exec(text)) !== null) {
+    var value = stripTags(unwrapText(match[1]))
+    if (value !== "") out.push(value)
+  }
   return out
 }
 
-// ISO-8601 week number: the week owning the Thursday of that date's
-// Monday-based week. Mirrors the clock widget's 'ww' format token.
-function isoWeek(year, month, day) {
-  var date = new Date(Date.UTC(year, month, day))
-  var weekday = date.getUTCDay() || 7
-  date.setUTCDate(date.getUTCDate() + 4 - weekday)
-  var yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1))
-  return Math.ceil(((date.getTime() - yearStart.getTime()) / MS_PER_DAY + 1) / 7)
+// RFC 822 (the format RSS pubDate uses) parses fine with the platform Date
+// constructor; anything that doesn't parse yields null rather than an
+// Invalid Date leaking into callers.
+function parsePubDate(text) {
+  var raw = String(text === undefined || text === null ? "" : text).trim()
+  if (raw === "") return null
+  var ms = Date.parse(raw)
+  return isFinite(ms) ? ms : null
 }
 
-function dayOfYear(year, month, day) {
-  return Math.round((Date.UTC(year, month, day) - Date.UTC(year, 0, 1)) / MS_PER_DAY) + 1
-}
+// Normalizes one raw <item> block into the flat shape the panel renders a
+// row from. Items missing both a link and a guid are dropped: without one
+// of those there is nothing safe to open and nothing stable to de-duplicate
+// or key a list delegate on.
+function normalizeItem(itemXml) {
+  var title = stripTags(extractTag(itemXml, "title")) || "(untitled)"
+  var link = extractTag(itemXml, "link").trim()
+  var guid = extractTag(itemXml, "guid").trim()
+  var creator = stripTags(extractTag(itemXml, "dc:creator"))
+  var pubDateText = extractTag(itemXml, "pubDate")
+  var pubDateMs = parsePubDate(pubDateText)
+  var categories = extractCategories(itemXml)
 
-function daysInYear(year) {
-  return dayOfYear(year, 11, 31)
-}
+  var url = isSafeHttpUrl(link) ? link : (isSafeHttpUrl(guid) ? guid : "")
+  var key = url !== "" ? url : guid
+  if (key === "") return null
 
-// Share of the year already behind you: whole days completed over days in
-// the year, so January 1 reads 0% and December 31 reads 100%.
-function yearProgress(year, month, day) {
-  var total = daysInYear(year)
-  if (total <= 0) return 0
-  return Math.max(0, Math.min(1, (dayOfYear(year, month, day) - 1) / total))
-}
-
-function yearProgressPercent(year, month, day) {
-  return Math.round(yearProgress(year, month, day) * 100)
-}
-
-// Memento mori. The default span is a round number rather than anything from
-// an actuarial table: the point of the bar is the reminder, not the
-// arithmetic, and whoever wants a different number can say so.
-var DEFAULT_LIFE_EXPECTANCY = 90
-
-// A birth year rather than an age, so the bar keeps counting on its own
-// instead of going stale the moment it is entered. 0 means "not set", which
-// is also what a blank, malformed, future, or implausibly distant year means.
-function parseBirthYear(value, currentYear) {
-  var now = Math.round(Number(currentYear))
-  if (!isFinite(now)) return 0
-  var text = String(value === undefined || value === null ? "" : value).replace(/^\s+|\s+$/g, "")
-  if (!/^\d{4}$/.test(text)) return 0
-  var year = parseInt(text, 10)
-  if (!isFinite(year) || year > now || year < now - 120) return 0
-  return year
-}
-
-// Whole years, the way people say their age: born in 1979 makes you 47 for
-// all of 2026, whichever side of your birthday today falls.
-function ageFromBirthYear(birthYear, currentYear) {
-  var born = parseBirthYear(birthYear, currentYear)
-  if (born <= 0) return 0
-  return Math.round(Number(currentYear)) - born
-}
-
-// 0 means "not set", which is also what a blank, negative, fractional, or
-// absurd entry means — the life bar simply stays hidden.
-function parseAge(value) {
-  var text = String(value === undefined || value === null ? "" : value).replace(/^\s+|\s+$/g, "")
-  if (!/^\d+$/.test(text)) return 0
-  var years = parseInt(text, 10)
-  if (!isFinite(years) || years <= 0 || years > 120) return 0
-  return years
-}
-
-// Unset or nonsense falls back to the default rather than to zero, so the
-// bar always has something to measure against.
-function parseLifeExpectancy(value) {
-  var text = String(value === undefined || value === null ? "" : value).replace(/^\s+|\s+$/g, "")
-  if (!/^\d+$/.test(text)) return DEFAULT_LIFE_EXPECTANCY
-  var years = parseInt(text, 10)
-  if (!isFinite(years) || years <= 0 || years > 150) return DEFAULT_LIFE_EXPECTANCY
-  return years
-}
-
-function lifeProgress(age, expectancy) {
-  var years = parseAge(age)
-  var span = parseLifeExpectancy(expectancy)
-  if (years <= 0 || span <= 0) return 0
-  return Math.max(0, Math.min(1, years / span))
-}
-
-function lifeProgressPercent(age, expectancy) {
-  return Math.round(lifeProgress(age, expectancy) * 100)
-}
-
-// Always six rows of seven days. A fixed grid keeps the popup exactly the
-// same height in every month, so stepping through the year never makes the
-// panel jump under the pointer.
-function monthGrid(year, month, weekStart, todayKey) {
-  var start = normalizedWeekStart(weekStart, 1)
-  var leading = (new Date(year, month, 1).getDay() - start + 7) % 7
-  var cursor = new Date(year, month, 1 - leading)
-  var today = String(todayKey || "")
-  var weeks = []
-
-  for (var w = 0; w < 6; w++) {
-    var days = []
-    var thursday = null
-    for (var d = 0; d < 7; d++) {
-      var cellYear = cursor.getFullYear()
-      var cellMonth = cursor.getMonth()
-      var cellDay = cursor.getDate()
-      var weekday = cursor.getDay()
-      var key = dateKey(cellYear, cellMonth, cellDay)
-      if (weekday === 4) thursday = { year: cellYear, month: cellMonth, day: cellDay }
-      days.push({
-        key: key,
-        year: cellYear,
-        month: cellMonth,
-        day: cellDay,
-        weekday: weekday,
-        inMonth: cellMonth === month && cellYear === year,
-        weekend: weekday === 0 || weekday === 6,
-        today: key === today
-      })
-      cursor.setDate(cursor.getDate() + 1)
-    }
-    // Number every row by the ISO week owning its Thursday. That is the
-    // definition itself for Monday-start weeks, and the only answer that
-    // stays stable for the other starts, where a row straddles two ISO
-    // weeks but shares all of Monday through Thursday with one of them.
-    var anchor = thursday || days[0]
-    weeks.push({
-      week: isoWeek(anchor.year, anchor.month, anchor.day),
-      days: days
-    })
+  return {
+    key: key,
+    title: title,
+    url: url,
+    author: creator,
+    category: categories.length > 0 ? categories[0] : "",
+    pubDateMs: pubDateMs
   }
-  return weeks
 }
 
-function stepMonth(year, month, delta) {
-  var target = new Date(year, Number(month) + Number(delta), 1)
-  return { year: target.getFullYear(), month: target.getMonth() }
+// Parses a full RSS document into the de-duplicated, newest-first post list
+// this widget shows. De-duplication is by link/guid (not title): the feed
+// mirrors the same post under multiple sub-blogs with identical titles but
+// distinct canonical links, and those are legitimately different entries.
+// Items with no usable date sort after every dated item, oldest-first among
+// themselves, since there's no better ordering signal for them. At most
+// MAX_POSTS are returned.
+function parseFeed(xmlText) {
+  var blocks = extractItemBlocks(xmlText)
+  var seen = {}
+  var posts = []
+  for (var i = 0; i < blocks.length; i++) {
+    var post = normalizeItem(blocks[i])
+    if (!post || seen[post.key]) continue
+    seen[post.key] = true
+    posts.push(post)
+  }
+  posts.sort(function(a, b) {
+    var am = a.pubDateMs === null ? -1 : a.pubDateMs
+    var bm = b.pubDateMs === null ? -1 : b.pubDateMs
+    return bm - am
+  })
+  if (posts.length > MAX_POSTS) posts = posts.slice(0, MAX_POSTS)
+  return posts
 }
 
 if (typeof module !== "undefined") {
   module.exports = {
-    dateKey: dateKey,
-    keyForDate: keyForDate,
-    normalizedWeekStart: normalizedWeekStart,
-    weekStartSettingName: weekStartSettingName,
-    toggledWeekStart: toggledWeekStart,
-    weekdayOrder: weekdayOrder,
-    isoWeek: isoWeek,
-    dayOfYear: dayOfYear,
-    daysInYear: daysInYear,
-    yearProgress: yearProgress,
-    yearProgressPercent: yearProgressPercent,
-    parseAge: parseAge,
-    parseBirthYear: parseBirthYear,
-    ageFromBirthYear: ageFromBirthYear,
-    parseLifeExpectancy: parseLifeExpectancy,
-    lifeProgress: lifeProgress,
-    lifeProgressPercent: lifeProgressPercent,
-    monthGrid: monthGrid,
-    stepMonth: stepMonth,
-    clockFormats: clockFormats,
-    clockNeedsSeconds: clockNeedsSeconds,
-    clockFormatRing: clockFormatRing,
-    nextClockFormat: nextClockFormat,
-    isoWeekLiteral: isoWeekLiteral
+    MAX_OUTPUT_CHARS: MAX_OUTPUT_CHARS,
+    MAX_ITEMS_SCANNED: MAX_ITEMS_SCANNED,
+    MAX_POSTS: MAX_POSTS,
+    capOutput: capOutput,
+    appendCapped: appendCapped,
+    wasCapped: wasCapped,
+    isSafeHttpUrl: isSafeHttpUrl,
+    decodeEntities: decodeEntities,
+    unwrapText: unwrapText,
+    stripTags: stripTags,
+    extractItemBlocks: extractItemBlocks,
+    extractTag: extractTag,
+    extractCategories: extractCategories,
+    parsePubDate: parsePubDate,
+    normalizeItem: normalizeItem,
+    parseFeed: parseFeed
   }
 }

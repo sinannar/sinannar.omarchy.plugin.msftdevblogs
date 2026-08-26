@@ -5,64 +5,103 @@ import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 
-// Date/time label for the bar, and the host for the calendar popup.
+// Bar presence for the Microsoft for Developers RSS feed
+// (https://devblogs.microsoft.com/landing/). This widget only ever fetches
+// and displays the feed's own posts — it never remembers read/unread state
+// or filters by category.
 //
-// Left click reveals the calendar — asking "what is the date?" is what a
-// click on a clock means — right click walks the common label formats, and
-// middle click opens the timezone picker.
+// BarWidget.qml owns feed retrieval and polling; Panel.qml owns rendering
+// the post list and opening posts in the browser.
 BarWidget {
   id: root
-  moduleName: "omarchy.clock"
+  moduleName: "sinannar.omarchy.plugin.msftdevblogs"
 
-  property date displayDate: clock.date
+  readonly property string feedUrl: "https://devblogs.microsoft.com/landing/"
+  readonly property int pollIntervalSec: Math.max(60, Number(setting("pollIntervalSec", 900)))
 
-  readonly property string configuredFormat: vertical
-    ? setting("verticalFormat", "HH\n—\nmm")
-    : setting("format", "dddd HH:mm")
-  readonly property string configuredAltFormat: vertical
-    ? setting("verticalFormatAlt", "dd\nMMM\n'W'ww\n''yy")
-    : setting("formatAlt", "d MMMM 'W'ww yyyy")
+  // Last successfully parsed posts, newest first. Kept even while a refresh
+  // is in flight (and across a failed refresh) so the bar/panel never blank
+  // out mid-poll or after a transient network hiccup.
+  property var posts: []
+  property bool loading: false
+  property bool lastPollFailed: false
+  property bool everPolled: false
+  property string feedStdoutText: ""
+  property string feedStderrText: ""
 
-  readonly property var formatRing: Model.clockFormatRing(configuredFormat, configuredAltFormat, Model.clockFormats(vertical))
+  readonly property var latestPost: posts.length > 0 ? posts[0] : null
 
-  // What the bar shows is what shell.json stores, so a cycled format is the
-  // format from then on rather than something that reverts on restart.
-  readonly property string activeFormat: configuredFormat
-
-  // A seconds label needs the clock to tick sixty times as often, and a
-  // repaint a second is a price only the formats that print seconds pay.
-  readonly property bool showsSeconds: Model.clockNeedsSeconds(activeFormat)
-  readonly property string displayText: formatted(displayDate)
-  readonly property var verticalLines: displayText.split("\n")
+  readonly property color statusColor: {
+    if (!everPolled || lastPollFailed) return Qt.darker(bar ? bar.foreground : Color.foreground, 1.5)
+    return bar ? bar.foreground : Color.foreground
+  }
 
   function refresh() {
-    displayDate = new Date()
-    if (panelLoader.item && panelLoader.item.refresh) panelLoader.item.refresh()
+    if (feedProcess.running) return
+    root.loading = true
+    root.feedStdoutText = ""
+    root.feedStderrText = ""
+    feedProcess.running = true
   }
 
-  function cycleFormat() {
-    var current = String(configuredFormat)
-    var next = Model.nextClockFormat(formatRing, current)
-    if (next === "" || next === current) return
+  Process {
+    id: feedProcess
+    command: ["curl", "-fsSL", "--max-time", "10", root.feedUrl]
 
-    var entry = { id: root.moduleName }
-    for (var key in root.settings) if (key !== "id") entry[key] = root.settings[key]
-    entry[vertical ? "verticalFormat" : "format"] = next
+    // Collect incrementally with a hard cap so memory stays bounded even if
+    // the feed emits unexpectedly large output.
+    stdout: SplitParser {
+      splitMarker: ""
+      onRead: function(data) { root.feedStdoutText = Model.appendCapped(root.feedStdoutText, data) }
+    }
+    stderr: SplitParser {
+      splitMarker: ""
+      onRead: function(data) { root.feedStderrText = Model.appendCapped(root.feedStderrText, data) }
+    }
 
-    // Applied locally first so the label changes on the click itself; the
-    // shell.json write comes back through the bar as the same value.
-    root.settings = entry
-    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
-      root.bar.shell.updateEntryInline(root.moduleName, entry)
+    onExited: function(exitCode) {
+      root.loading = false
+      root.everPolled = true
+      if (exitCode !== 0) {
+        // Keep the last good snapshot on a transient failure (network down,
+        // curl missing, feed temporarily unreachable) rather than flashing
+        // to empty.
+        root.lastPollFailed = true
+        return
+      }
+      // A capped response (root.feedStdoutText hit MAX_OUTPUT_CHARS) means
+      // the feed was truncated mid-stream, not that it has zero posts.
+      // Treat that as a poll failure — keep the last good snapshot — rather
+      // than letting a resulting empty parse blank the panel.
+      if (Model.wasCapped(root.feedStdoutText)) {
+        var parsed = Model.parseFeed(root.feedStdoutText)
+        if (parsed.length === 0) {
+          root.lastPollFailed = true
+          return
+        }
+      }
+      var posts = Model.parseFeed(root.feedStdoutText)
+      if (posts.length === 0) {
+        // An empty parse of a non-truncated response is treated the same
+        // way: a malformed/unexpected document is more likely than the feed
+        // genuinely publishing zero posts, so the last good snapshot is
+        // kept rather than shown as "no posts".
+        root.lastPollFailed = true
+        return
+      }
+      root.lastPollFailed = false
+      root.posts = posts
+    }
   }
 
-  function formatted(date) {
-    return Qt.formatDateTime(date, activeFormat.replace(/ww/g, Model.isoWeekLiteral(date.getFullYear(), date.getMonth(), date.getDate())))
+  Timer {
+    interval: root.pollIntervalSec * 1000
+    running: true
+    repeat: true
+    triggeredOnStart: true
+    onTriggered: root.refresh()
   }
 
-  // ---- Calendar popup. Shape contract for shell.summon/hide/toggle
-  //      routing: Bar.findPanelWidget requires open/close/opened on the
-  //      bar-widget root.
   readonly property bool opened: panelLoader.item ? panelLoader.item.opened === true : false
 
   function open() {
@@ -77,27 +116,6 @@ BarWidget {
     if (panelLoader.item) panelLoader.item.toggle()
   }
 
-  function toggleWeekStart() {
-    if (panelLoader.item) panelLoader.item.toggleWeekStart()
-  }
-
-  // The clock fills more slot than it paints a mark for, at both
-  // orientations: horizontally it is a text label in a padded slot, so the
-  // dot takes the label width; vertically it is a stack of icon-sized lines,
-  // so the dot takes one line — the same mark every icon widget gets, rather
-  // than a rule running the height of the whole stack.
-  readonly property real openPanelIndicatorWidth: button.labelWidth
-  readonly property real openPanelIndicatorHeight: Math.max(Style.space(10), Math.round(Style.bar.iconSlot * 0.55))
-
-  // Forwarded so this widget can stand in for the panel as the bar's popout
-  // identity: Bar.requestPopout prefers closeForPopoutSwitch over close, and
-  // KeyboardPanel reads popoutSwitchClosing back off its owner.
-  readonly property bool popoutSwitchClosing: panelLoader.item ? panelLoader.item.popoutSwitchClosing === true : false
-
-  function closeForPopoutSwitch() {
-    if (panelLoader.item) panelLoader.item.closeForPopoutSwitch()
-  }
-
   function injectPanel() {
     var target = panelLoader.item
     if (!target) return
@@ -105,6 +123,7 @@ BarWidget {
     if ("settings" in target) target.settings = root.settings
     if ("anchorItem" in target) target.anchorItem = button
     if ("hostWidget" in target) target.hostWidget = root
+    if ("posts" in target) target.posts = root.posts
   }
 
   implicitWidth: button.implicitWidth
@@ -112,12 +131,9 @@ BarWidget {
 
   onBarChanged: injectPanel()
   onSettingsChanged: injectPanel()
+  onPostsChanged: injectPanel()
 
-  SystemClock {
-    id: clock
-    precision: root.showsSeconds ? SystemClock.Seconds : SystemClock.Minutes
-    onDateChanged: root.displayDate = date
-  }
+  Component.onCompleted: refresh()
 
   Loader {
     id: panelLoader
@@ -131,11 +147,9 @@ BarWidget {
   }
 
   IpcHandler {
-    target: "omarchy.clock"
+    target: "sinannar.omarchy.plugin.msftdevblogs"
 
-    function refresh(): void { root.broadcast("refresh") }
-    function cycleFormat(): void { root.cycleFormat() }
-    function toggleWeekStart(): void { root.toggleWeekStart() }
+    function refresh(): void { root.refresh() }
     function open(): void { root.open() }
     function close(): void { root.close() }
     function show(): void { root.open() }
@@ -147,39 +161,18 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.vertical ? "" : root.displayText
-    labelVisible: !root.vertical
-    hasVisualContent: root.vertical ? root.verticalLines.length > 0 : text !== ""
-    fixedHeight: root.vertical ? root.verticalLines.length * Style.bar.iconSlot : -1
-    horizontalMargin: 8.75
-    verticalPadding: 8.75
-    tooltipText: "Right-click to toggle format"
+    // Newspaper glyph stands in for "developer blog posts"; it needs no
+    // Nerd Font glyph table, just emoji fallback, so it renders regardless
+    // of the configured bar font.
+    text: "📰"
+    foreground: root.statusColor
+    tooltipText: root.lastPollFailed
+      ? "Microsoft Dev Blogs feed unavailable — click to retry"
+      : (root.latestPost ? root.latestPost.title : "Loading Microsoft Dev Blogs…")
 
     onPressed: function(b) {
-      if (b === Qt.RightButton) root.cycleFormat()
-      else if (b === Qt.MiddleButton) { if (root.bar) root.bar.run("omarchy-menu-timezone") }
+      if (b === Qt.MiddleButton) root.refresh()
       else root.togglePanel()
-    }
-
-    Column {
-      visible: root.vertical
-      anchors.fill: parent
-
-      Repeater {
-        model: root.verticalLines
-
-        OpticalGlyph {
-          required property string modelData
-          width: button.width
-          height: Style.bar.iconSlot
-          text: modelData
-          fontFamily: button.fontFamily
-          fontSize: modelData.length > 3
-            ? button.fontSize * 0.9
-            : button.fontSize
-          color: button.foreground
-        }
-      }
     }
   }
 }
