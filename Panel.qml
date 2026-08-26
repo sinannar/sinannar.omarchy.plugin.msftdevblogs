@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import qs.Commons
 import qs.Ui
@@ -65,6 +66,14 @@ Panel {
     root.persistPinnedCategories([])
   }
 
+  // "Filters" reads as a plain label when nothing is pinned, or gets a
+  // count suffix once one or more categories are pinned — the only
+  // filter-state indicator visible in the main panel now that the full
+  // category list lives in a popup instead of an always-expanded row.
+  readonly property string filtersButtonText: root.pinnedCategoryKeys.length === 0
+    ? "Filters"
+    : "Filters (" + root.pinnedCategoryKeys.length + ")"
+
   function switchPanel(direction) {
     if (root.bar && typeof root.bar.switchPanelFrom === "function")
       return root.bar.switchPanelFrom(root.barIdentity, direction)
@@ -78,7 +87,12 @@ Panel {
     if (root.hostWidget && typeof root.hostWidget.refresh === "function") root.hostWidget.refresh()
   }
 
-  onOpenedChanged: if (opened) requestBarRefresh()
+  // Closing the panel always closes any open category picker with it, so
+  // reopening the panel later never resumes with a stray popup visible.
+  onOpenedChanged: {
+    if (opened) requestBarRefresh()
+    else if (categoryPopup.opened) categoryPopup.close()
+  }
 
   // A relative-if-recent, absolute-otherwise timestamp: "just now" reads
   // more usefully than an absolute time for something that just happened,
@@ -130,13 +144,14 @@ Panel {
           spacing: Style.space(14)
 
           Item {
+            id: headerRow
             width: parent.width
-            height: Math.max(titleColumn.implicitHeight, refreshBtn.implicitHeight)
+            height: Math.max(titleColumn.implicitHeight, refreshBtn.implicitHeight, filtersBtn.implicitHeight)
 
             Column {
               id: titleColumn
               anchors.left: parent.left
-              anchors.right: refreshBtn.left
+              anchors.right: filtersBtn.visible ? filtersBtn.left : refreshBtn.left
               anchors.rightMargin: Style.space(10)
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(1)
@@ -162,6 +177,25 @@ Panel {
               }
             }
 
+            // Replaces the always-expanded category chip row: a single
+            // compact control that opens a bounded, scrollable popup with
+            // the full category list, keeping the panel's height stable
+            // however many categories the feed happens to publish. The
+            // button label itself carries the only filter-state summary
+            // ("Filters" vs "Filters (N)") needed in the main panel.
+            Button {
+              id: filtersBtn
+              visible: root.availableCategories.length > 0
+              anchors.right: refreshBtn.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              text: root.filtersButtonText
+              fontFamily: root.contentFontFamily
+              foreground: root.contentForeground
+              bordered: true
+              onClicked: categoryPopup.opened ? categoryPopup.close() : categoryPopup.open()
+            }
+
             Button {
               id: refreshBtn
               anchors.right: parent.right
@@ -172,99 +206,123 @@ Panel {
               bordered: true
               onClicked: root.requestBarRefresh()
             }
+
+            Popup {
+              id: categoryPopup
+              x: filtersBtn.x + filtersBtn.width - width
+              y: filtersBtn.y + filtersBtn.height + Style.space(4)
+              width: Style.space(300)
+              height: Math.min(popupColumn.implicitHeight + Style.space(16), Style.space(360))
+              padding: Style.space(8)
+              modal: false
+              focus: true
+              closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+              background: BorderSurface {
+                color: Color.popups.background
+                borderSpec: Border.flat(Qt.darker(root.contentForeground, 1.6), 1)
+                radius: Style.cornerRadius
+              }
+
+              contentItem: Flickable {
+                id: popupFlick
+                width: parent.width
+                contentWidth: width
+                contentHeight: popupColumn.implicitHeight
+                clip: true
+                boundsBehavior: Flickable.StopAtBounds
+                interactive: contentHeight > height
+
+                Column {
+                  id: popupColumn
+                  width: popupFlick.width
+                  spacing: Style.space(8)
+
+                  PanelSectionHeader {
+                    text: "Categories"
+                    foreground: root.contentForeground
+                    fontFamily: root.contentFontFamily
+                  }
+
+                  Flow {
+                    width: popupColumn.width
+                    spacing: Style.space(6)
+
+                    // "All" clears any pins and shows every retained post;
+                    // it reads as pinned itself whenever no category is
+                    // currently pinned, so exactly one chip here is always
+                    // active.
+                    Rectangle {
+                      id: allChip
+                      readonly property bool pinned: root.pinnedCategoryKeys.length === 0
+                      width: allLabel.implicitWidth + Style.space(16)
+                      height: allLabel.implicitHeight + Style.space(8)
+                      radius: Style.space(6)
+                      color: allChip.pinned ? root.contentForeground : "transparent"
+                      border.width: allChip.pinned ? 0 : 1
+                      border.color: Qt.darker(root.contentForeground, 1.6)
+
+                      Text {
+                        id: allLabel
+                        anchors.centerIn: parent
+                        text: "All"
+                        textFormat: Text.PlainText
+                        color: allChip.pinned ? Color.popups.background : root.contentForeground
+                        font.family: root.contentFontFamily
+                        font.pixelSize: Style.font.caption
+                      }
+
+                      MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.clearPins()
+                      }
+                    }
+
+                    // Category chips are written inline here (not as a
+                    // separately declared `component`) so `modelData` binds
+                    // directly — the same nested-component pitfall
+                    // documented on the post-row Repeater below only bites
+                    // when a named component type is instantiated as the
+                    // delegate itself.
+                    Repeater {
+                      model: root.availableCategories
+
+                      Rectangle {
+                        id: chip
+                        required property var modelData
+                        readonly property bool pinned: root.pinnedCategoryKeys.indexOf(chip.modelData.key) !== -1
+                        width: chipLabel.implicitWidth + Style.space(16)
+                        height: chipLabel.implicitHeight + Style.space(8)
+                        radius: Style.space(6)
+                        color: chip.pinned ? root.contentForeground : "transparent"
+                        border.width: chip.pinned ? 0 : 1
+                        border.color: Qt.darker(root.contentForeground, 1.6)
+
+                        Text {
+                          id: chipLabel
+                          anchors.centerIn: parent
+                          text: chip.modelData.name
+                          textFormat: Text.PlainText
+                          color: chip.pinned ? Color.popups.background : root.contentForeground
+                          font.family: root.contentFontFamily
+                          font.pixelSize: Style.font.caption
+                        }
+
+                        MouseArea {
+                          anchors.fill: parent
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: root.togglePin(chip.modelData.key)
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
 
           PanelSeparator {
-            foreground: root.contentForeground
-          }
-
-          Column {
-            id: categorySection
-            visible: root.availableCategories.length > 0
-            width: column.width
-            spacing: Style.space(6)
-
-            PanelSectionHeader {
-              text: "Categories"
-              foreground: root.contentForeground
-              fontFamily: root.contentFontFamily
-            }
-
-            Flow {
-              width: categorySection.width
-              spacing: Style.space(6)
-
-              // "All" clears any pins and shows every retained post; it
-              // reads as pinned itself whenever no category is currently
-              // pinned, so exactly one chip in this row is always active.
-              Rectangle {
-                id: allChip
-                readonly property bool pinned: root.pinnedCategoryKeys.length === 0
-                width: allLabel.implicitWidth + Style.space(16)
-                height: allLabel.implicitHeight + Style.space(8)
-                radius: Style.space(6)
-                color: allChip.pinned ? root.contentForeground : "transparent"
-                border.width: allChip.pinned ? 0 : 1
-                border.color: Qt.darker(root.contentForeground, 1.6)
-
-                Text {
-                  id: allLabel
-                  anchors.centerIn: parent
-                  text: "All"
-                  textFormat: Text.PlainText
-                  color: allChip.pinned ? (Color.popups.background) : root.contentForeground
-                  font.family: root.contentFontFamily
-                  font.pixelSize: Style.font.caption
-                }
-
-                MouseArea {
-                  anchors.fill: parent
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: root.clearPins()
-                }
-              }
-
-              // Category chips are written inline here (not as a separately
-              // declared `component`) so `modelData` binds directly — the
-              // same nested-component pitfall documented on the post-row
-              // Repeater below only bites when a named component type is
-              // instantiated as the delegate itself.
-              Repeater {
-                model: root.availableCategories
-
-                Rectangle {
-                  id: chip
-                  required property var modelData
-                  readonly property bool pinned: root.pinnedCategoryKeys.indexOf(chip.modelData.key) !== -1
-                  width: chipLabel.implicitWidth + Style.space(16)
-                  height: chipLabel.implicitHeight + Style.space(8)
-                  radius: Style.space(6)
-                  color: chip.pinned ? root.contentForeground : "transparent"
-                  border.width: chip.pinned ? 0 : 1
-                  border.color: Qt.darker(root.contentForeground, 1.6)
-
-                  Text {
-                    id: chipLabel
-                    anchors.centerIn: parent
-                    text: chip.modelData.name
-                    textFormat: Text.PlainText
-                    color: chip.pinned ? (Color.popups.background) : root.contentForeground
-                    font.family: root.contentFontFamily
-                    font.pixelSize: Style.font.caption
-                  }
-
-                  MouseArea {
-                    anchors.fill: parent
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.togglePin(chip.modelData.key)
-                  }
-                }
-              }
-            }
-          }
-
-          PanelSeparator {
-            visible: categorySection.visible
             foreground: root.contentForeground
           }
 
