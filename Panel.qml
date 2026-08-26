@@ -144,12 +144,26 @@ Panel {
             Repeater {
               model: root.posts
 
-              PostRow {
+              // `modelData`/`index` don't bind into a nested `component`
+              // declaration used directly as a Repeater delegate — a plain
+              // wrapper Item takes them as required properties and passes
+              // them down explicitly instead (same shape as the network
+              // widget's Wi-Fi list delegate).
+              delegate: Item {
+                id: wrapper
+                required property var modelData
+                required property int index
                 width: column.width
-                post: modelData
-                contentForeground: root.contentForeground
-                contentFontFamily: root.contentFontFamily
-                dateText: root.formatPostDate(modelData.pubDateMs)
+                height: postRow.height
+
+                PostRow {
+                  id: postRow
+                  width: wrapper.width
+                  post: wrapper.modelData
+                  contentForeground: root.contentForeground
+                  contentFontFamily: root.contentFontFamily
+                  dateText: root.formatPostDate(wrapper.modelData.pubDateMs)
+                }
               }
             }
           }

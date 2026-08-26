@@ -161,10 +161,11 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    // Newspaper glyph stands in for "developer blog posts"; it needs no
-    // Nerd Font glyph table, just emoji fallback, so it renders regardless
-    // of the configured bar font.
-    text: "📰"
+    // nf-fa-laptop: the bar renders through JetBrainsMono Nerd Font, which
+    // has no color-emoji fallback glyph, so a plain emoji here rendered as
+    // a blank/missing-glyph box. A Nerd Font codepoint from the same font
+    // renders correctly and reads as "developer machine".
+    text: "\uf109"
     foreground: root.statusColor
     tooltipText: root.lastPollFailed
       ? "Microsoft Dev Blogs feed unavailable — click to retry"
