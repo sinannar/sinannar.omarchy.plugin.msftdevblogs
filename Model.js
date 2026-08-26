@@ -16,11 +16,15 @@
 // MAX_OUTPUT_CHARS – UTF-16 code units accepted from curl's stdout before
 //   truncation (~1 MB for the mostly-ASCII XML this feed serves).
 // MAX_ITEMS_SCANNED – <item> blocks read out of the raw XML before giving up.
-// MAX_POSTS         – posts ever kept/returned after de-duplication and
-//   sorting; the panel only ever shows the ten most recent.
+// MAX_POSTS         – posts ever *displayed* in the panel at once, after
+//   de-duplication, sorting, and any category filtering.
+// MAX_PINNED_CATEGORIES – category pins ever honored from a persisted
+//   setting, so a hand-edited or corrupted shell.json entry can't make
+//   filtering scale with an attacker-chosen list length.
 var MAX_OUTPUT_CHARS = 1 * 1024 * 1024
 var MAX_ITEMS_SCANNED = 200
 var MAX_POSTS = 10
+var MAX_PINNED_CATEGORIES = 20
 
 function capOutput(text) {
   var s = String(text === undefined || text === null ? "" : text)
@@ -147,6 +151,15 @@ function parsePubDate(text) {
 // row from. Items missing both a link and a guid are dropped: without one
 // of those there is nothing safe to open and nothing stable to de-duplicate
 // or key a list delegate on.
+// Case/whitespace-normalized identity for a category name, used to compare
+// and de-duplicate categories without being tripped up by a feed producer's
+// inconsistent capitalization of the same tag (rare, but seen in the wild).
+// The *displayed* name always comes from the first-seen original spelling,
+// not this normalized form.
+function categoryKey(name) {
+  return String(name === undefined || name === null ? "" : name).trim().toLowerCase()
+}
+
 function normalizeItem(itemXml) {
   var title = stripTags(extractTag(itemXml, "title")) || "(untitled)"
   var link = extractTag(itemXml, "link").trim()
@@ -165,18 +178,29 @@ function normalizeItem(itemXml) {
     title: title,
     url: url,
     author: creator,
+    // The full category list is kept (not just the first) so a post can be
+    // matched against any pinned category it belongs to, not only its
+    // primary one. `category` stays as the single display category (the
+    // feed's first-listed one) for the byline shown on every row.
+    categories: categories,
     category: categories.length > 0 ? categories[0] : "",
     pubDateMs: pubDateMs
   }
 }
 
 // Parses a full RSS document into the de-duplicated, newest-first post list
-// this widget shows. De-duplication is by link/guid (not title): the feed
+// this widget retains. De-duplication is by link/guid (not title): the feed
 // mirrors the same post under multiple sub-blogs with identical titles but
 // distinct canonical links, and those are legitimately different entries.
 // Items with no usable date sort after every dated item, oldest-first among
-// themselves, since there's no better ordering signal for them. At most
-// MAX_POSTS are returned.
+// themselves, since there's no better ordering signal for them.
+//
+// Unlike the ten-post cap the *panel* applies, this returns every
+// de-duplicated post the feed response contained (already bounded by
+// MAX_ITEMS_SCANNED upstream) — a category pin needs the full retained set
+// to filter before re-applying the ten-item display cap, since a pinned
+// category's ten most recent posts are not necessarily within the ten most
+// recent posts overall.
 function parseFeed(xmlText) {
   var blocks = extractItemBlocks(xmlText)
   var seen = {}
@@ -192,8 +216,73 @@ function parseFeed(xmlText) {
     var bm = b.pubDateMs === null ? -1 : b.pubDateMs
     return bm - am
   })
-  if (posts.length > MAX_POSTS) posts = posts.slice(0, MAX_POSTS)
   return posts
+}
+
+// Every category currently present across the retained posts, in
+// first-seen order. Posts are already newest-first, so this doubles as
+// "most-recently-used category first" — the order the panel's chip row
+// lists categories in. Deduplicated case/whitespace-insensitively but
+// displayed under whichever original spelling was seen first.
+function aggregateCategories(posts) {
+  var list = Array.isArray(posts) ? posts : []
+  var seen = {}
+  var out = []
+  for (var i = 0; i < list.length; i++) {
+    var categories = Array.isArray(list[i].categories) ? list[i].categories : []
+    for (var j = 0; j < categories.length; j++) {
+      var name = categories[j]
+      var key = categoryKey(name)
+      if (key === "" || seen[key]) continue
+      seen[key] = true
+      out.push({ key: key, name: name })
+    }
+  }
+  return out
+}
+
+// Normalizes a persisted `pinnedCategories` setting (any shape shell.json
+// might hand back — an array, undefined, a stray non-array value from hand
+// editing) into a de-duplicated list of lowercased category keys. At most
+// MAX_PINNED_CATEGORIES are kept so a corrupted setting can't cause
+// unbounded filtering work.
+function normalizePinnedCategories(raw) {
+  var list = Array.isArray(raw) ? raw : []
+  var seen = {}
+  var out = []
+  for (var i = 0; i < list.length; i++) {
+    var key = categoryKey(list[i])
+    if (key === "" || seen[key]) continue
+    seen[key] = true
+    out.push(key)
+    if (out.length >= MAX_PINNED_CATEGORIES) break
+  }
+  return out
+}
+
+// True if `post` carries any of the (already-normalized) pinned category
+// keys. An empty pin list matches everything — "no pins" means "show
+// everything", not "show nothing".
+function postMatchesPins(post, normalizedPinKeys) {
+  if (!normalizedPinKeys || normalizedPinKeys.length === 0) return true
+  var categories = post && Array.isArray(post.categories) ? post.categories : []
+  for (var i = 0; i < categories.length; i++) {
+    if (normalizedPinKeys.indexOf(categoryKey(categories[i])) !== -1) return true
+  }
+  return false
+}
+
+// The list the panel actually renders: every retained post whose categories
+// intersect the pinned set (or every retained post, unfiltered, when
+// nothing is pinned), newest-first, capped to MAX_POSTS. `pinnedCategories`
+// is accepted in whatever raw shape the caller has on hand and normalized
+// here, so both the panel and any future caller can pass the settings value
+// straight through.
+function selectDisplayPosts(posts, pinnedCategories) {
+  var list = Array.isArray(posts) ? posts : []
+  var pins = normalizePinnedCategories(pinnedCategories)
+  var filtered = pins.length === 0 ? list : list.filter(function(post) { return postMatchesPins(post, pins) })
+  return filtered.length > MAX_POSTS ? filtered.slice(0, MAX_POSTS) : filtered
 }
 
 if (typeof module !== "undefined") {
@@ -201,6 +290,7 @@ if (typeof module !== "undefined") {
     MAX_OUTPUT_CHARS: MAX_OUTPUT_CHARS,
     MAX_ITEMS_SCANNED: MAX_ITEMS_SCANNED,
     MAX_POSTS: MAX_POSTS,
+    MAX_PINNED_CATEGORIES: MAX_PINNED_CATEGORIES,
     capOutput: capOutput,
     appendCapped: appendCapped,
     wasCapped: wasCapped,
@@ -212,7 +302,12 @@ if (typeof module !== "undefined") {
     extractTag: extractTag,
     extractCategories: extractCategories,
     parsePubDate: parsePubDate,
+    categoryKey: categoryKey,
     normalizeItem: normalizeItem,
-    parseFeed: parseFeed
+    parseFeed: parseFeed,
+    aggregateCategories: aggregateCategories,
+    normalizePinnedCategories: normalizePinnedCategories,
+    postMatchesPins: postMatchesPins,
+    selectDisplayPosts: selectDisplayPosts
   }
 }

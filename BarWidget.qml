@@ -7,11 +7,13 @@ import "Model.js" as Model
 
 // Bar presence for the Microsoft for Developers RSS feed
 // (https://devblogs.microsoft.com/landing/). This widget only ever fetches
-// and displays the feed's own posts — it never remembers read/unread state
-// or filters by category.
+// the feed's own posts — it never remembers read/unread state. Category
+// pinning (Panel.qml) filters which of the retained posts are displayed,
+// but every fetched post is still retained here regardless of pins, so
+// unpinning a category never requires a re-fetch to bring its posts back.
 //
 // BarWidget.qml owns feed retrieval and polling; Panel.qml owns rendering
-// the post list and opening posts in the browser.
+// the post list, category pin controls, and opening posts in the browser.
 BarWidget {
   id: root
   moduleName: "sinannar.omarchy.plugin.msftdevblogs"
@@ -157,7 +159,13 @@ BarWidget {
     function toggle(): void { root.togglePanel() }
   }
 
-  WidgetButton {
+  // BarIconButton (not the plain WidgetButton) for a single glyph: it centers
+  // through OpticalGlyph's tight-bounding-box math rather than raw advance
+  // width, which is what every other icon-only bar widget (bluetooth,
+  // network, monitor, microphone) uses. A plain WidgetButton centers the
+  // glyph in its full advance width, which for most Nerd Font icons paints
+  // visibly off-center relative to the module's own open-panel underline.
+  BarIconButton {
     id: button
     anchors.fill: parent
     bar: root.bar

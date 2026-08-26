@@ -25,6 +25,46 @@ Panel {
   readonly property color contentForeground: bar ? bar.foreground : Color.foreground
   readonly property string contentFontFamily: bar ? bar.fontFamily : Style.font.family
 
+  // Categories pinned from this widget's inline shell.json entry, normalized
+  // (bounded, de-duplicated, case/whitespace-folded keys). Empty means no
+  // filter — every retained post is shown.
+  readonly property var pinnedCategoryKeys: Model.normalizePinnedCategories(root.setting("pinnedCategories", []))
+  // Every category seen across the currently retained posts, ordered by
+  // first (most recent) occurrence — this is the full chip list, independent
+  // of any active filter.
+  readonly property var availableCategories: Model.aggregateCategories(root.posts)
+  // The posts actually rendered below: all retained posts when nothing is
+  // pinned, otherwise only posts matching at least one pinned category.
+  readonly property var displayPosts: Model.selectDisplayPosts(root.posts, root.pinnedCategoryKeys)
+
+  // Persists a full pin list to this widget's inline shell.json entry,
+  // matching the update-entry pattern used by built-in panels (clock's
+  // persistSettings, tailscale's persistRecentMullvad): merge the changed
+  // key into a clone of the current settings, apply it locally to both this
+  // panel and its host bar widget for an immediate UI update, then push the
+  // merged entry through the shell so it survives reloads/restarts.
+  function persistPinnedCategories(keys) {
+    var entry = { id: root.moduleName }
+    for (var existing in root.settings) if (existing !== "id") entry[existing] = root.settings[existing]
+    entry.pinnedCategories = keys
+
+    root.settings = entry
+    if (root.hostWidget && "settings" in root.hostWidget) root.hostWidget.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
+
+  function togglePin(categoryKey) {
+    var current = root.pinnedCategoryKeys
+    var index = current.indexOf(categoryKey)
+    var next = index === -1 ? current.concat([categoryKey]) : current.slice(0, index).concat(current.slice(index + 1))
+    root.persistPinnedCategories(Model.normalizePinnedCategories(next))
+  }
+
+  function clearPins() {
+    root.persistPinnedCategories([])
+  }
+
   function switchPanel(direction) {
     if (root.bar && typeof root.bar.switchPanelFrom === "function")
       return root.bar.switchPanelFrom(root.barIdentity, direction)
@@ -112,7 +152,9 @@ Panel {
               Text {
                 text: root.posts.length === 0
                   ? "No posts loaded yet"
-                  : root.posts.length + " recent post" + (root.posts.length === 1 ? "" : "s")
+                  : (root.pinnedCategoryKeys.length === 0
+                      ? root.posts.length + " recent post" + (root.posts.length === 1 ? "" : "s")
+                      : root.displayPosts.length + " of " + root.posts.length + " recent posts")
                 textFormat: Text.PlainText
                 color: Qt.darker(root.contentForeground, 1.4)
                 font.family: root.contentFontFamily
@@ -137,12 +179,102 @@ Panel {
           }
 
           Column {
-            visible: root.posts.length > 0
+            id: categorySection
+            visible: root.availableCategories.length > 0
+            width: column.width
+            spacing: Style.space(6)
+
+            PanelSectionHeader {
+              text: "Categories"
+              foreground: root.contentForeground
+              fontFamily: root.contentFontFamily
+            }
+
+            Flow {
+              width: categorySection.width
+              spacing: Style.space(6)
+
+              // "All" clears any pins and shows every retained post; it
+              // reads as pinned itself whenever no category is currently
+              // pinned, so exactly one chip in this row is always active.
+              Rectangle {
+                id: allChip
+                readonly property bool pinned: root.pinnedCategoryKeys.length === 0
+                width: allLabel.implicitWidth + Style.space(16)
+                height: allLabel.implicitHeight + Style.space(8)
+                radius: Style.space(6)
+                color: allChip.pinned ? root.contentForeground : "transparent"
+                border.width: allChip.pinned ? 0 : 1
+                border.color: Qt.darker(root.contentForeground, 1.6)
+
+                Text {
+                  id: allLabel
+                  anchors.centerIn: parent
+                  text: "All"
+                  textFormat: Text.PlainText
+                  color: allChip.pinned ? (Color.popups.background) : root.contentForeground
+                  font.family: root.contentFontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.clearPins()
+                }
+              }
+
+              // Category chips are written inline here (not as a separately
+              // declared `component`) so `modelData` binds directly — the
+              // same nested-component pitfall documented on the post-row
+              // Repeater below only bites when a named component type is
+              // instantiated as the delegate itself.
+              Repeater {
+                model: root.availableCategories
+
+                Rectangle {
+                  id: chip
+                  required property var modelData
+                  readonly property bool pinned: root.pinnedCategoryKeys.indexOf(chip.modelData.key) !== -1
+                  width: chipLabel.implicitWidth + Style.space(16)
+                  height: chipLabel.implicitHeight + Style.space(8)
+                  radius: Style.space(6)
+                  color: chip.pinned ? root.contentForeground : "transparent"
+                  border.width: chip.pinned ? 0 : 1
+                  border.color: Qt.darker(root.contentForeground, 1.6)
+
+                  Text {
+                    id: chipLabel
+                    anchors.centerIn: parent
+                    text: chip.modelData.name
+                    textFormat: Text.PlainText
+                    color: chip.pinned ? (Color.popups.background) : root.contentForeground
+                    font.family: root.contentFontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  MouseArea {
+                    anchors.fill: parent
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.togglePin(chip.modelData.key)
+                  }
+                }
+              }
+            }
+          }
+
+          PanelSeparator {
+            visible: categorySection.visible
+            foreground: root.contentForeground
+          }
+
+          Column {
+            visible: root.displayPosts.length > 0
             width: column.width
             spacing: Style.space(2)
 
             Repeater {
-              model: root.posts
+              model: root.displayPosts
 
               // `modelData`/`index` don't bind into a nested `component`
               // declaration used directly as a Repeater delegate — a plain
@@ -174,6 +306,17 @@ Panel {
             text: root.hostWidget && root.hostWidget.lastPollFailed
               ? "The Microsoft Dev Blogs feed is unavailable right now. Click Refresh to retry."
               : "Loading recent posts…"
+            textFormat: Text.PlainText
+            color: Qt.darker(root.contentForeground, 1.5)
+            font.family: root.contentFontFamily
+            font.pixelSize: Style.font.bodySmall
+            wrapMode: Text.WordWrap
+          }
+
+          Text {
+            visible: root.posts.length > 0 && root.displayPosts.length === 0
+            width: parent.width
+            text: "No recent posts match the pinned categories. Click All to clear the filter."
             textFormat: Text.PlainText
             color: Qt.darker(root.contentForeground, 1.5)
             font.family: root.contentFontFamily
