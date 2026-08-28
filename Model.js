@@ -9,19 +9,23 @@
 // (title, link, pubDate, dc:creator, category, guid) are simple leaf
 // elements that don't nest, which is what makes that safe to do here.
 
-// ---- Producer-side caps ----------------------------------------------------
+// ---- Response caps ---------------------------------------------------------
 // A malicious or unexpectedly bloated feed response can't exhaust memory in
-// the long-lived shell process.
+// the long-lived shell process. curl enforces MAX_RESPONSE_BYTES before it
+// reaches QML; BoundedStreamCollector.qml independently caps retained text.
 //
-// MAX_OUTPUT_CHARS – UTF-16 code units accepted from curl's stdout before
-//   truncation (~1 MB for the mostly-ASCII XML this feed serves).
+// MAX_RESPONSE_BYTES – bytes curl accepts from the response body.
+// MAX_OUTPUT_CHARS – UTF-16 code units retained by the QML stream collector.
+//   The feed is mostly ASCII, so the two limits intentionally share a 1 MiB
+//   budget.
 // MAX_ITEMS_SCANNED – <item> blocks read out of the raw XML before giving up.
 // MAX_POSTS         – posts ever *displayed* in the panel at once, after
 //   de-duplication, sorting, and any category filtering.
 // MAX_PINNED_CATEGORIES – category pins ever honored from a persisted
 //   setting, so a hand-edited or corrupted shell.json entry can't make
 //   filtering scale with an attacker-chosen list length.
-var MAX_OUTPUT_CHARS = 1 * 1024 * 1024
+var MAX_RESPONSE_BYTES = 1 * 1024 * 1024
+var MAX_OUTPUT_CHARS = MAX_RESPONSE_BYTES
 var MAX_ITEMS_SCANNED = 200
 var MAX_POSTS = 10
 var MAX_PINNED_CATEGORIES = 20
@@ -288,6 +292,7 @@ function selectDisplayPosts(posts, pinnedCategories) {
 if (typeof module !== "undefined") {
   module.exports = {
     MAX_OUTPUT_CHARS: MAX_OUTPUT_CHARS,
+    MAX_RESPONSE_BYTES: MAX_RESPONSE_BYTES,
     MAX_ITEMS_SCANNED: MAX_ITEMS_SCANNED,
     MAX_POSTS: MAX_POSTS,
     MAX_PINNED_CATEGORIES: MAX_PINNED_CATEGORIES,

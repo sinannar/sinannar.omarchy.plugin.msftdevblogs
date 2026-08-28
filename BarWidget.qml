@@ -28,9 +28,6 @@ BarWidget {
   property bool loading: false
   property bool lastPollFailed: false
   property bool everPolled: false
-  property string feedStdoutText: ""
-  property string feedStderrText: ""
-
   readonly property var latestPost: posts.length > 0 ? posts[0] : null
 
   readonly property color statusColor: {
@@ -41,48 +38,37 @@ BarWidget {
   function refresh() {
     if (feedProcess.running) return
     root.loading = true
-    root.feedStdoutText = ""
-    root.feedStderrText = ""
+    feedStdout.reset()
+    feedStderr.reset()
     feedProcess.running = true
   }
 
   Process {
     id: feedProcess
-    command: ["curl", "-fsSL", "--max-time", "10", root.feedUrl]
+    // --location with zero permitted redirects rejects redirects explicitly;
+    // --max-filesize bounds bytes before they enter the shell process.
+    command: [
+      "curl", "-fsSL", "--max-time", "10",
+      "--max-filesize", String(Model.MAX_RESPONSE_BYTES),
+      "--max-redirs", "0", root.feedUrl
+    ]
 
-    // Collect incrementally with a hard cap so memory stays bounded even if
-    // the feed emits unexpectedly large output.
-    stdout: SplitParser {
-      splitMarker: ""
-      onRead: function(data) { root.feedStdoutText = Model.appendCapped(root.feedStdoutText, data) }
-    }
-    stderr: SplitParser {
-      splitMarker: ""
-      onRead: function(data) { root.feedStderrText = Model.appendCapped(root.feedStderrText, data) }
-    }
+    // These collectors independently bound retained process output before
+    // parseFeed sees it. Both streams are capped to avoid error-output growth.
+    stdout: BoundedStreamCollector { id: feedStdout }
+    stderr: BoundedStreamCollector { id: feedStderr }
 
     onExited: function(exitCode) {
       root.loading = false
       root.everPolled = true
-      if (exitCode !== 0) {
+      if (exitCode !== 0 || feedStdout.overflowed || feedStderr.overflowed) {
         // Keep the last good snapshot on a transient failure (network down,
-        // curl missing, feed temporarily unreachable) rather than flashing
-        // to empty.
+        // curl missing, oversized/redirected response, or unavailable feed)
+        // rather than flashing to empty.
         root.lastPollFailed = true
         return
       }
-      // A capped response (root.feedStdoutText hit MAX_OUTPUT_CHARS) means
-      // the feed was truncated mid-stream, not that it has zero posts.
-      // Treat that as a poll failure — keep the last good snapshot — rather
-      // than letting a resulting empty parse blank the panel.
-      if (Model.wasCapped(root.feedStdoutText)) {
-        var parsed = Model.parseFeed(root.feedStdoutText)
-        if (parsed.length === 0) {
-          root.lastPollFailed = true
-          return
-        }
-      }
-      var posts = Model.parseFeed(root.feedStdoutText)
+      var posts = Model.parseFeed(feedStdout.text)
       if (posts.length === 0) {
         // An empty parse of a non-truncated response is treated the same
         // way: a malformed/unexpected document is more likely than the feed

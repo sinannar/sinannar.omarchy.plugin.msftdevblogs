@@ -15,12 +15,13 @@ before relying on that behavior.
 
 ## Safety invariants
 
-- Invoke curl only as an argv array: `["curl", "-fsSL", "--max-time", "10",
-  root.feedUrl]`. Never introduce a shell, shell interpolation, or a
-  concatenated command string.
-- Collect output incrementally with `Model.appendCapped`; preserve its 1 MiB
-  bound. On a curl failure, parse failure, or malformed capped response, keep
-  the last good posts rather than clearing the UI.
+- Invoke curl only as an argv array, including `-fsSL`, `--max-time 10`,
+  `--max-filesize 1048576`, and `--max-redirs 0`. Never introduce a shell,
+  shell interpolation, or a concatenated command string.
+- Route stdout and stderr through `BoundedStreamCollector`; preserve its 1 MiB
+  consumer-side bound independently of curl's producer-side size limit. On a
+  curl failure, collector overflow, or parse failure, keep the last good posts
+  rather than clearing the UI.
 - Retain parser scan, rendered-post, and pinned-category limits: 200, 10,
   and 20 respectively.
 - Pass a feed URL to `Qt.openUrlExternally` only after

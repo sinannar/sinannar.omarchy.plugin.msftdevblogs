@@ -22,12 +22,13 @@ actions consistent when changing either side.
 
 ## Non-negotiable feed safety
 
-1. Curl remains an argv-only call with `-fsSL` and `--max-time 10`:
-   `["curl", "-fsSL", "--max-time", "10", root.feedUrl]`. Never use shell
+1. Curl remains an argv-only call with `-fsSL`, `--max-time 10`,
+   `--max-filesize 1048576`, and `--max-redirs 0`. Never use shell
    interpolation or build a shell command from feed/settings data.
-2. Stream stdout/stderr through `appendCapped`, retaining the 1 MiB
-   collection bound. Failures from curl or parsing, including a malformed
-   capped response, must retain prior good posts.
+2. Stream stdout/stderr through `BoundedStreamCollector`, retaining its 1 MiB
+   consumer-side collection bound independently of curl's producer-side cap.
+   Failures from curl, collector overflow, or parsing must retain prior good
+   posts.
 3. Preserve bounds: scan at most 200 RSS items, render at most 10 posts, and
    honor at most 20 pinned categories.
 4. Open only `http`/`https` URLs after `isSafeHttpUrl`; no other scheme may

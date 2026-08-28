@@ -93,11 +93,12 @@ omarchy-shell sinannar.omarchy.plugin.msftdevblogs toggle   # toggle panel
 This is a read-only feed viewer, but its network input is treated as
 untrusted:
 
-- Retrieval uses `curl -fsSL --max-time 10`, so failed HTTP responses are
-  errors and a request has a 10-second limit.
-- Feed output is collected as a stream with a hard 1 MiB cap. At most 200 RSS
-  items are scanned, at most 10 posts are rendered, and no more than 20
-  persisted category pins are honored.
+- Retrieval uses `curl -fsSL --max-time 10 --max-filesize 1048576
+  --max-redirs 0`, so failed HTTP responses, redirects, and bodies over 1 MiB
+  are errors, and a request has a 10-second limit.
+- A bounded streaming collector independently retains at most 1 MiB of stdout
+  or stderr before parsing. At most 200 RSS items are scanned, at most 10
+  posts are rendered, and no more than 20 persisted category pins are honored.
 - Feed-provided text is rendered with `Text.PlainText`; it is not interpreted
   as rich text or QML.
 - Only HTTP(S) URLs pass the link check before `Qt.openUrlExternally` is
@@ -108,9 +109,10 @@ untrusted:
 ## Troubleshooting
 
 - **The widget says the feed is unavailable** — confirm `curl` is installed
-  and `curl -fsSL --max-time 10 https://devblogs.microsoft.com/landing/`
-  succeeds from a terminal. Click the widget or use the `refresh` IPC action
-  to retry.
+  and `curl -fsSL --max-time 10 --max-filesize 1048576 --max-redirs 0
+  https://devblogs.microsoft.com/landing/` succeeds from a terminal. The
+  endpoint must not redirect and its response must be no larger than 1 MiB.
+  Click the widget or use the `refresh` IPC action to retry.
 - **No posts appear yet** — the initial fetch may still be running, or the
   most recent fetch failed. Open the panel and select **Refresh**.
 - **A category has no visible posts** — it may not occur among retained posts,
@@ -133,6 +135,7 @@ omarchy plugin remove sinannar.omarchy.plugin.msftdevblogs
 |---|---|
 | `manifest.json` | Plugin metadata and bar-widget entry point |
 | `BarWidget.qml` | RSS retrieval, polling, retained snapshot, bar interaction, and IPC |
+| `BoundedStreamCollector.qml` | Bounded streaming stdout/stderr collection before parsing |
 | `Panel.qml` | Post list, category filters, refresh control, and safe external link opening |
 | `Model.js` | Bounded RSS parsing, normalization, filtering, and URL validation |
 | `preview.png` | Conventional plugin preview, copied from the default widget screenshot |
